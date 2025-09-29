@@ -19,10 +19,13 @@ You can resume a previous headless run to continue the same conversation context
 Interactive TUI equivalent:
 
 ```shell
-codex resume             # picker
-codex resume --last      # most recent
+codex resume             # picker (current directory)
+codex resume --last      # most recent (current directory)
+codex resume --all       # picker across every directory
 codex resume <SESSION_ID>
 ```
+
+By default `codex resume` only lists sessions created from your current working directory. Pass `--all` to browse everything recorded under `~/.codex/sessions`.
 
 Compatibility:
 

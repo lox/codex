@@ -27,6 +27,9 @@ pub struct Cli {
     #[clap(skip)]
     pub resume_session_id: Option<String>,
 
+    #[clap(skip)]
+    pub resume_all_dirs: bool,
+
     /// Model the agent should use.
     #[arg(long, short = 'm')]
     pub model: Option<String>,

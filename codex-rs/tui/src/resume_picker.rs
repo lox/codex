@@ -30,6 +30,7 @@ use crate::tui::TuiEvent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InputMessageKind;
+use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 
 const PAGE_SIZE: usize = 25;
@@ -63,7 +64,11 @@ enum BackgroundEvent {
 /// Interactive session picker that lists recorded rollout files with simple
 /// search and pagination. Shows the first user input as the preview, relative
 /// time (e.g., "5 seconds ago"), and the absolute path.
-pub async fn run_resume_picker(tui: &mut Tui, codex_home: &Path) -> Result<ResumeSelection> {
+pub async fn run_resume_picker(
+    tui: &mut Tui,
+    codex_home: &Path,
+    filter_cwd: Option<&Path>,
+) -> Result<ResumeSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
 
@@ -89,6 +94,7 @@ pub async fn run_resume_picker(tui: &mut Tui, codex_home: &Path) -> Result<Resum
         codex_home.to_path_buf(),
         alt.tui.frame_requester(),
         page_loader,
+        filter_cwd.map(std::path::Path::to_path_buf),
     );
     state.load_initial_page().await?;
     state.request_frame();
@@ -163,6 +169,7 @@ struct PickerState {
     next_search_token: usize,
     page_loader: PageLoader,
     view_rows: Option<usize>,
+    filter_cwd: Option<PathBuf>,
 }
 
 struct PaginationState {
@@ -217,12 +224,18 @@ impl SearchState {
 #[derive(Clone)]
 struct Row {
     path: PathBuf,
+    cwd: Option<PathBuf>,
     preview: String,
     ts: Option<DateTime<Utc>>,
 }
 
 impl PickerState {
-    fn new(codex_home: PathBuf, requester: FrameRequester, page_loader: PageLoader) -> Self {
+    fn new(
+        codex_home: PathBuf,
+        requester: FrameRequester,
+        page_loader: PageLoader,
+        filter_cwd: Option<PathBuf>,
+    ) -> Self {
         Self {
             codex_home,
             requester,
@@ -243,6 +256,7 @@ impl PickerState {
             next_search_token: 0,
             page_loader,
             view_rows: None,
+            filter_cwd,
         }
     }
 
@@ -377,7 +391,8 @@ impl PickerState {
             self.pagination.reached_scan_cap = true;
         }
 
-        let rows = rows_from_items(page.items);
+        let mut rows = rows_from_items(page.items);
+        rows.sort_by(|a, b| b.ts.cmp(&a.ts));
         for row in rows {
             if self.seen_paths.insert(row.path.clone()) {
                 self.all_rows.push(row);
@@ -388,25 +403,39 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
+        let base = self
+            .all_rows
+            .iter()
+            .filter(|row| self.row_matches_filter(row));
+
         if self.query.is_empty() {
-            self.filtered_rows = self.all_rows.clone();
+            self.filtered_rows = base.cloned().collect();
         } else {
             let q = self.query.to_lowercase();
-            self.filtered_rows = self
-                .all_rows
-                .iter()
+            self.filtered_rows = base
                 .filter(|r| r.preview.to_lowercase().contains(&q))
                 .cloned()
                 .collect();
         }
+
         if self.selected >= self.filtered_rows.len() {
             self.selected = self.filtered_rows.len().saturating_sub(1);
         }
         if self.filtered_rows.is_empty() {
             self.scroll_top = 0;
+            if self.filter_cwd.is_some() && !self.pagination.reached_scan_cap {
+                self.load_more_if_needed(LoadTrigger::Scroll);
+            }
         }
         self.ensure_selected_visible();
         self.request_frame();
+    }
+
+    fn row_matches_filter(&self, row: &Row) -> bool {
+        match &self.filter_cwd {
+            Some(filter) => row.cwd.as_ref().map(|cwd| cwd == filter).unwrap_or(false),
+            None => true,
+        }
     }
 
     fn set_query(&mut self, new_query: String) {
@@ -564,8 +593,24 @@ fn rows_from_items(items: Vec<ConversationItem>) -> Vec<Row> {
 }
 
 fn head_to_row(item: &ConversationItem) -> Row {
-    let mut ts: Option<DateTime<Utc>> = None;
-    if let Some(first) = item.head.first()
+    let mut ts: Option<DateTime<Utc>> = std::fs::metadata(&item.path)
+        .and_then(|meta| meta.modified())
+        .map(DateTime::<Utc>::from)
+        .ok();
+    let mut cwd: Option<PathBuf> = None;
+
+    for value in &item.head {
+        if let Ok(meta_line) = serde_json::from_value::<SessionMetaLine>(value.clone()) {
+            cwd = Some(meta_line.meta.cwd.clone());
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&meta_line.meta.timestamp) {
+                ts = Some(parsed.with_timezone(&Utc));
+            }
+            break;
+        }
+    }
+
+    if ts.is_none()
+        && let Some(first) = item.head.first()
         && let Some(t) = first.get("timestamp").and_then(|v| v.as_str())
         && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(t)
     {
@@ -579,6 +624,7 @@ fn head_to_row(item: &ConversationItem) -> Row {
 
     Row {
         path: item.path.clone(),
+        cwd,
         preview,
         ts,
     }
@@ -627,6 +673,7 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
     let height = tui.terminal.size()?.height;
     tui.draw(height, |frame| {
         let area = frame.area();
+        frame.render_widget_ref(ratatui::widgets::Clear, area);
         let [header, search, list, hint] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -635,7 +682,6 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
         ])
         .areas(area);
 
-        // Header
         frame.render_widget_ref(
             Line::from(vec!["Resume a previous session".bold().cyan()]),
             header,
@@ -786,6 +832,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use codex_protocol::mcp_protocol::ConversationId;
+    use codex_protocol::protocol::SessionMeta;
+
     fn head_with_ts_and_user_text(ts: &str, texts: &[&str]) -> Vec<serde_json::Value> {
         vec![
             json!({ "timestamp": ts }),
@@ -800,10 +849,34 @@ mod tests {
         ]
     }
 
+    fn head_with_meta(ts: &str, cwd: &str, texts: &[&str]) -> Vec<serde_json::Value> {
+        let mut head = head_with_ts_and_user_text(ts, texts);
+        let meta = SessionMetaLine {
+            meta: SessionMeta {
+                id: ConversationId::new(),
+                timestamp: ts.to_string(),
+                cwd: PathBuf::from(cwd),
+                originator: "cli".to_string(),
+                cli_version: "test".to_string(),
+                instructions: None,
+            },
+            git: None,
+        };
+        head.insert(0, serde_json::to_value(meta).expect("serializes"));
+        head
+    }
+
     fn make_item(path: &str, ts: &str, preview: &str) -> ConversationItem {
         ConversationItem {
             path: PathBuf::from(path),
             head: head_with_ts_and_user_text(ts, &[preview]),
+        }
+    }
+
+    fn make_item_with_meta(path: &str, ts: &str, cwd: &str, preview: &str) -> ConversationItem {
+        ConversationItem {
+            path: PathBuf::from(path),
+            head: head_with_meta(ts, cwd, &[preview]),
         }
     }
 
@@ -878,8 +951,12 @@ mod tests {
     #[test]
     fn pageless_scrolling_deduplicates_and_keeps_order() {
         let loader: PageLoader = Arc::new(|_| {});
-        let mut state =
-            PickerState::new(PathBuf::from("/tmp"), FrameRequester::test_dummy(), loader);
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            None,
+        );
 
         state.reset_pagination();
         state.ingest_page(page(
@@ -933,6 +1010,79 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_cwd_limits_rows() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            Some(PathBuf::from("/work/project")),
+        );
+
+        state.reset_pagination();
+        state.ingest_page(page(
+            vec![
+                make_item_with_meta(
+                    "/tmp/match.jsonl",
+                    "2025-01-03T00:00:00Z",
+                    "/work/project",
+                    "match",
+                ),
+                make_item_with_meta(
+                    "/tmp/skip.jsonl",
+                    "2025-01-02T00:00:00Z",
+                    "/work/other",
+                    "skip",
+                ),
+            ],
+            None,
+            2,
+            false,
+        ));
+
+        let previews: Vec<_> = state
+            .filtered_rows
+            .iter()
+            .map(|row| row.preview.as_str())
+            .collect();
+        assert_eq!(previews, vec!["match"]);
+    }
+
+    #[test]
+    fn filter_requests_more_pages_when_empty() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded_requests.clone();
+        let loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
+            sink.lock().unwrap().push(request);
+        });
+
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            Some(PathBuf::from("/work/project")),
+        );
+        state.reset_pagination();
+        state.ingest_page(page(
+            vec![make_item_with_meta(
+                "/tmp/other.jsonl",
+                "2025-01-01T00:00:00Z",
+                "/work/elsewhere",
+                "other",
+            )],
+            Some(cursor_from_str(
+                "2025-01-01T00-00-00|00000000-0000-0000-0000-000000000000",
+            )),
+            1,
+            false,
+        ));
+
+        let guard = recorded_requests.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert!(guard[0].search_token.is_none());
+    }
+
+    #[test]
     fn ensure_minimum_rows_prefetches_when_underfilled() {
         let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let request_sink = recorded_requests.clone();
@@ -940,8 +1090,12 @@ mod tests {
             request_sink.lock().unwrap().push(req);
         });
 
-        let mut state =
-            PickerState::new(PathBuf::from("/tmp"), FrameRequester::test_dummy(), loader);
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            None,
+        );
         state.reset_pagination();
         state.ingest_page(page(
             vec![
@@ -965,8 +1119,12 @@ mod tests {
     #[test]
     fn page_navigation_uses_view_rows() {
         let loader: PageLoader = Arc::new(|_| {});
-        let mut state =
-            PickerState::new(PathBuf::from("/tmp"), FrameRequester::test_dummy(), loader);
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            None,
+        );
 
         let mut items = Vec::new();
         for idx in 0..20 {
@@ -1009,8 +1167,12 @@ mod tests {
     #[test]
     fn up_at_bottom_does_not_scroll_when_visible() {
         let loader: PageLoader = Arc::new(|_| {});
-        let mut state =
-            PickerState::new(PathBuf::from("/tmp"), FrameRequester::test_dummy(), loader);
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            None,
+        );
 
         let mut items = Vec::new();
         for idx in 0..10 {
@@ -1049,8 +1211,12 @@ mod tests {
             request_sink.lock().unwrap().push(req);
         });
 
-        let mut state =
-            PickerState::new(PathBuf::from("/tmp"), FrameRequester::test_dummy(), loader);
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            None,
+        );
         state.reset_pagination();
         state.ingest_page(page(
             vec![make_item(

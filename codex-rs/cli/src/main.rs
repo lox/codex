@@ -105,6 +105,10 @@ struct ResumeCommand {
     #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
     last: bool,
 
+    /// Show sessions from all directories instead of the current working directory.
+    #[arg(long = "all", default_value_t = false)]
+    all_dirs: bool,
+
     #[clap(flatten)]
     config_overrides: TuiCli,
 }
@@ -253,6 +257,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         Some(Subcommand::Resume(ResumeCommand {
             session_id,
             last,
+            all_dirs,
             config_overrides,
         })) => {
             interactive = finalize_resume_interactive(
@@ -260,6 +265,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
                 session_id,
                 last,
+                all_dirs,
                 config_overrides,
             );
             codex_tui::run_main(interactive, codex_linux_sandbox_exe).await?;
@@ -355,6 +361,7 @@ fn finalize_resume_interactive(
     root_config_overrides: CliConfigOverrides,
     session_id: Option<String>,
     last: bool,
+    all_dirs: bool,
     resume_cli: TuiCli,
 ) -> TuiCli {
     // Start with the parsed interactive CLI so resume shares the same
@@ -363,6 +370,7 @@ fn finalize_resume_interactive(
     interactive.resume_picker = resume_session_id.is_none() && !last;
     interactive.resume_last = last;
     interactive.resume_session_id = resume_session_id;
+    interactive.resume_all_dirs = all_dirs;
 
     // Merge resume-scoped flags and overrides with highest precedence.
     merge_resume_cli_flags(&mut interactive, resume_cli);
@@ -410,6 +418,9 @@ fn merge_resume_cli_flags(interactive: &mut TuiCli, resume_cli: TuiCli) {
     if let Some(prompt) = resume_cli.prompt {
         interactive.prompt = Some(prompt);
     }
+    if resume_cli.resume_all_dirs {
+        interactive.resume_all_dirs = true;
+    }
 
     interactive
         .config_overrides
@@ -440,13 +451,21 @@ mod tests {
         let Subcommand::Resume(ResumeCommand {
             session_id,
             last,
+            all_dirs,
             config_overrides: resume_cli,
         }) = subcommand.expect("resume present")
         else {
             unreachable!()
         };
 
-        finalize_resume_interactive(interactive, root_overrides, session_id, last, resume_cli)
+        finalize_resume_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all_dirs,
+            resume_cli,
+        )
     }
 
     fn sample_exit_info(conversation: Option<&str>) -> AppExitInfo {
@@ -599,6 +618,14 @@ mod tests {
         assert!(interactive.dangerously_bypass_approvals_and_sandbox);
         assert!(interactive.resume_picker);
         assert!(!interactive.resume_last);
+        assert_eq!(interactive.resume_session_id, None);
+    }
+
+    #[test]
+    fn resume_all_flag_enables_all_dirs() {
+        let interactive = finalize_from_args(["codex", "resume", "--all"].as_ref());
+        assert!(interactive.resume_picker);
+        assert!(interactive.resume_all_dirs);
         assert_eq!(interactive.resume_session_id, None);
     }
 }

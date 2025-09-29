@@ -8,6 +8,7 @@ pub use app::AppExitInfo;
 use codex_core::AuthManager;
 use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use codex_core::CodexAuth;
+use codex_core::ConversationItem;
 use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -20,7 +21,9 @@ use codex_core::protocol::SandboxPolicy;
 use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::mcp_protocol::AuthMode;
+use codex_protocol::protocol::SessionMetaLine;
 use std::fs::OpenOptions;
+use std::path::Path;
 use std::path::PathBuf;
 use tracing::error;
 use tracing_appender::non_blocking;
@@ -356,6 +359,12 @@ async fn run_ratatui_app(
         }
     }
 
+    let resume_filter_cwd = if cli.resume_all_dirs {
+        None
+    } else {
+        Some(config.cwd.clone())
+    };
+
     // Determine resume behavior: explicit id, then resume last, then picker.
     let resume_selection = if let Some(id_str) = cli.resume_session_id.as_deref() {
         match find_conversation_path_by_id_str(&config.codex_home, id_str).await? {
@@ -366,16 +375,21 @@ async fn run_ratatui_app(
             }
         }
     } else if cli.resume_last {
-        match RolloutRecorder::list_conversations(&config.codex_home, 1, None).await {
-            Ok(page) => page
-                .items
-                .first()
-                .map(|it| resume_picker::ResumeSelection::Resume(it.path.clone()))
-                .unwrap_or(resume_picker::ResumeSelection::StartFresh),
+        match find_latest_conversation_for_filter(&config.codex_home, resume_filter_cwd.as_deref())
+            .await
+        {
+            Ok(Some(path)) => resume_picker::ResumeSelection::Resume(path),
+            Ok(None) => resume_picker::ResumeSelection::StartFresh,
             Err(_) => resume_picker::ResumeSelection::StartFresh,
         }
     } else if cli.resume_picker {
-        match resume_picker::run_resume_picker(&mut tui, &config.codex_home).await? {
+        match resume_picker::run_resume_picker(
+            &mut tui,
+            &config.codex_home,
+            resume_filter_cwd.as_deref(),
+        )
+        .await?
+        {
             resume_picker::ResumeSelection::Exit => {
                 restore();
                 session_log::log_session_end();
@@ -408,6 +422,45 @@ async fn run_ratatui_app(
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
     app_result
+}
+
+fn conversation_matches_cwd(item: &ConversationItem, filter: &Path) -> bool {
+    item.head
+        .iter()
+        .find_map(|value| serde_json::from_value::<SessionMetaLine>(value.clone()).ok())
+        .map(|meta| meta.meta.cwd == filter)
+        .unwrap_or(false)
+}
+
+async fn find_latest_conversation_for_filter(
+    codex_home: &Path,
+    filter_cwd: Option<&Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    match filter_cwd {
+        None => {
+            let page = RolloutRecorder::list_conversations(codex_home, 1, None).await?;
+            Ok(page.items.into_iter().next().map(|it| it.path))
+        }
+        Some(filter) => {
+            let mut cursor = None;
+            loop {
+                let page =
+                    RolloutRecorder::list_conversations(codex_home, 50, cursor.as_ref()).await?;
+                if let Some(path) = page
+                    .items
+                    .iter()
+                    .find(|item| conversation_matches_cwd(item, filter))
+                    .map(|item| item.path.clone())
+                {
+                    return Ok(Some(path));
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => return Ok(None),
+                }
+            }
+        }
+    }
 }
 
 #[expect(
