@@ -586,13 +586,15 @@ fn rows_from_items(items: Vec<ConversationItem>) -> Vec<Row> {
 }
 
 fn head_to_row(item: &ConversationItem) -> Row {
-    let mut ts: Option<DateTime<Utc>> = None;
-    if let Some(first) = item.head.first()
-        && let Some(t) = first.get("timestamp").and_then(|v| v.as_str())
-        && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(t)
-    {
-        ts = Some(parsed.with_timezone(&Utc));
-    }
+    // Use file mtime instead of creation timestamp from SessionMeta
+    let ts: Option<DateTime<Utc>> = std::fs::metadata(&item.path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|modified| {
+            let duration = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+            let secs = duration.as_secs() as i64;
+            DateTime::from_timestamp(secs, 0)
+        });
 
     let preview = preview_from_head(&item.head)
         .map(|s| s.trim().to_string())
