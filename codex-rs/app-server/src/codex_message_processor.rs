@@ -709,6 +709,7 @@ impl CodexMessageProcessor {
             &self.config.codex_home,
             page_size,
             cursor_ref,
+            None, // TODO: Add cwd filter support
         )
         .await
         {
