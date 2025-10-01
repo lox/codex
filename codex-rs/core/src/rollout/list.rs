@@ -64,16 +64,24 @@ fn matches_cwd_filter(head: &[serde_json::Value], filter_cwd: &Path) -> bool {
     false
 }
 
-/// Pagination cursor identifying a file by timestamp and UUID.
+/// Pagination cursor identifying a file by its modification time and UUID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
-    ts: OffsetDateTime,
+    /// File modification time (mtime) as seconds since Unix epoch.
+    mtime_secs: i64,
+    /// Nanoseconds component of mtime for sub-second precision.
+    mtime_nanos: u32,
+    /// Conversation UUID from the filename (for stable ordering).
     id: Uuid,
 }
 
 impl Cursor {
-    fn new(ts: OffsetDateTime, id: Uuid) -> Self {
-        Self { ts, id }
+    fn new(mtime_secs: i64, mtime_nanos: u32, id: Uuid) -> Self {
+        Self {
+            mtime_secs,
+            mtime_nanos,
+            id,
+        }
     }
 }
 
@@ -82,13 +90,11 @@ impl serde::Serialize for Cursor {
     where
         S: serde::Serializer,
     {
-        let ts_str = self
-            .ts
-            .format(&format_description!(
-                "[year]-[month]-[day]T[hour]-[minute]-[second]"
-            ))
-            .map_err(|e| serde::ser::Error::custom(format!("format error: {e}")))?;
-        serializer.serialize_str(&format!("{ts_str}|{}", self.id))
+        // Format: "{mtime_secs}.{mtime_nanos}|{uuid}"
+        serializer.serialize_str(&format!(
+            "{}.{:09}|{}",
+            self.mtime_secs, self.mtime_nanos, self.id
+        ))
     }
 }
 
@@ -104,8 +110,9 @@ impl<'de> serde::Deserialize<'de> for Cursor {
 
 /// Retrieve recorded conversation file paths with token pagination. The returned `next_cursor`
 /// can be supplied on the next call to resume after the last returned item, resilient to
-/// concurrent new sessions being appended. Ordering is stable by timestamp desc, then UUID desc.
-/// If `cwd_filter` is provided, only conversations from that working directory are included.
+/// concurrent new sessions being appended. Ordering is by mtime desc (most recently modified first),
+/// then UUID desc for stable ordering. If `cwd_filter` is provided, only conversations from that
+/// working directory are included.
 pub(crate) async fn get_conversations(
     codex_home: &Path,
     page_size: usize,
@@ -141,23 +148,19 @@ pub(crate) async fn get_conversation(path: &Path) -> io::Result<String> {
 /// Load conversation file paths from disk using directory traversal.
 ///
 /// Directory layout: `~/.codex/sessions/YYYY/MM/DD/rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl`
-/// Returned newest (latest) first.
+/// Sorted by mtime desc (most recently modified first).
 async fn traverse_directories_for_paths(
     root: PathBuf,
     page_size: usize,
     anchor: Option<Cursor>,
     cwd_filter: Option<&Path>,
 ) -> io::Result<ConversationsPage> {
-    let mut items: Vec<ConversationItem> = Vec::with_capacity(page_size);
+    // Collect all rollout files with their mtime and UUID
+    let mut all_files: Vec<(i64, u32, Uuid, PathBuf)> = Vec::new();
     let mut scanned_files = 0usize;
-    let mut anchor_passed = anchor.is_none();
-    let (anchor_ts, anchor_id) = match anchor {
-        Some(c) => (c.ts, c.id),
-        None => (OffsetDateTime::UNIX_EPOCH, Uuid::nil()),
-    };
 
+    // Traverse all directories to collect files
     let year_dirs = collect_dirs_desc(&root, |s| s.parse::<u16>().ok()).await?;
-
     'outer: for (_year, year_path) in year_dirs.iter() {
         if scanned_files >= MAX_SCAN_FILES {
             break;
@@ -172,50 +175,63 @@ async fn traverse_directories_for_paths(
                 if scanned_files >= MAX_SCAN_FILES {
                     break 'outer;
                 }
-                let mut day_files = collect_files(day_path, |name_str, path| {
-                    if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
-                        return None;
-                    }
-
-                    parse_timestamp_uuid_from_filename(name_str)
-                        .map(|(ts, id)| (ts, id, name_str.to_string(), path.to_path_buf()))
-                })
-                .await?;
-                // Stable ordering within the same second: (timestamp desc, uuid desc)
-                day_files.sort_by_key(|(ts, sid, _name_str, _path)| (Reverse(*ts), Reverse(*sid)));
-                for (ts, sid, _name_str, path) in day_files.into_iter() {
-                    scanned_files += 1;
-                    if scanned_files >= MAX_SCAN_FILES && items.len() >= page_size {
-                        break 'outer;
-                    }
-                    if !anchor_passed {
-                        if ts < anchor_ts || (ts == anchor_ts && sid < anchor_id) {
-                            anchor_passed = true;
-                        } else {
-                            continue;
-                        }
-                    }
-                    if items.len() == page_size {
-                        break 'outer;
-                    }
-                    // Read head and simultaneously detect message events within the same
-                    // first N JSONL records to avoid a second file read.
-                    let (head, tail, saw_session_meta, saw_user_event) =
-                        read_head_and_tail(&path, HEAD_RECORD_LIMIT, TAIL_RECORD_LIMIT)
-                            .await
-                            .unwrap_or((Vec::new(), Vec::new(), false, false));
-                    // Apply filters: must have session meta and at least one user message event
-                    if saw_session_meta && saw_user_event {
-                        // If cwd_filter is set, check if conversation matches
-                        if let Some(filter_cwd) = cwd_filter {
-                            if !matches_cwd_filter(&head, filter_cwd) {
-                                continue;
-                            }
-                        }
-                        items.push(ConversationItem { path, head, tail });
-                    }
+                let day_files = collect_files_with_mtime(day_path).await?;
+                scanned_files += day_files.len();
+                all_files.extend(day_files);
+                if scanned_files >= MAX_SCAN_FILES {
+                    break 'outer;
                 }
             }
+        }
+    }
+
+    // Sort by mtime desc, then uuid desc for stability
+    all_files.sort_by_key(|(mtime_secs, mtime_nanos, id, _path)| {
+        (Reverse(*mtime_secs), Reverse(*mtime_nanos), Reverse(*id))
+    });
+
+    // Apply pagination using anchor
+    let mut items: Vec<ConversationItem> = Vec::with_capacity(page_size);
+    let mut anchor_passed = anchor.is_none();
+    let (anchor_mtime_secs, anchor_mtime_nanos, anchor_id) = match &anchor {
+        Some(c) => (c.mtime_secs, c.mtime_nanos, c.id),
+        None => (i64::MAX, u32::MAX, Uuid::max()),
+    };
+
+    for (mtime_secs, mtime_nanos, id, path) in all_files.into_iter() {
+        if !anchor_passed {
+            // Check if we've passed the anchor point
+            if mtime_secs < anchor_mtime_secs
+                || (mtime_secs == anchor_mtime_secs && mtime_nanos < anchor_mtime_nanos)
+                || (mtime_secs == anchor_mtime_secs
+                    && mtime_nanos == anchor_mtime_nanos
+                    && id < anchor_id)
+            {
+                anchor_passed = true;
+            } else {
+                continue;
+            }
+        }
+
+        if items.len() >= page_size {
+            break;
+        }
+
+        // Read head and tail to validate and filter
+        let (head, tail, saw_session_meta, saw_user_event) =
+            read_head_and_tail(&path, HEAD_RECORD_LIMIT, TAIL_RECORD_LIMIT)
+                .await
+                .unwrap_or((Vec::new(), Vec::new(), false, false));
+
+        // Apply filters: must have session meta and at least one user message event
+        if saw_session_meta && saw_user_event {
+            // If cwd_filter is set, check if conversation matches
+            if let Some(filter_cwd) = cwd_filter {
+                if !matches_cwd_filter(&head, filter_cwd) {
+                    continue;
+                }
+            }
+            items.push(ConversationItem { path, head, tail });
         }
     }
 
@@ -291,28 +307,34 @@ pub async fn find_rollout_by_conversation_id(
     }
 }
 
-/// Pagination cursor token format: "<file_ts>|<uuid>" where `file_ts` matches the
-/// filename timestamp portion (YYYY-MM-DDThh-mm-ss) used in rollout filenames.
-/// The cursor orders files by timestamp desc, then UUID desc.
+/// Pagination cursor token format: "{mtime_secs}.{mtime_nanos}|{uuid}"
+/// The cursor orders files by mtime desc, then UUID desc.
 fn parse_cursor(token: &str) -> Option<Cursor> {
-    let (file_ts, uuid_str) = token.split_once('|')?;
+    let (mtime_str, uuid_str) = token.split_once('|')?;
+    let (secs_str, nanos_str) = mtime_str.split_once('.')?;
 
-    let Ok(uuid) = Uuid::parse_str(uuid_str) else {
-        return None;
-    };
+    let mtime_secs: i64 = secs_str.parse().ok()?;
+    let mtime_nanos: u32 = nanos_str.parse().ok()?;
+    let uuid = Uuid::parse_str(uuid_str).ok()?;
 
-    let format: &[FormatItem] =
-        format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
-    let ts = PrimitiveDateTime::parse(file_ts, format).ok()?.assume_utc();
-
-    Some(Cursor::new(ts, uuid))
+    Some(Cursor::new(mtime_secs, mtime_nanos, uuid))
 }
 
 fn build_next_cursor(items: &[ConversationItem]) -> Option<Cursor> {
     let last = items.last()?;
     let file_name = last.path.file_name()?.to_string_lossy();
-    let (ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
-    Some(Cursor::new(ts, id))
+    let (_ts, id) = parse_timestamp_uuid_from_filename(&file_name)?;
+
+    // Get the mtime of the last item
+    let metadata = std::fs::metadata(&last.path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let duration = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mtime_secs = duration.as_secs() as i64;
+    let mtime_nanos = duration.subsec_nanos();
+
+    Some(Cursor::new(mtime_secs, mtime_nanos, id))
 }
 
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
@@ -340,25 +362,54 @@ where
     Ok(vec)
 }
 
-/// Collects files in a directory and parses them with `parse`.
-async fn collect_files<T, F>(parent: &Path, parse: F) -> io::Result<Vec<T>>
-where
-    F: Fn(&str, &Path) -> Option<T>,
-{
+/// Collects rollout files in a directory with their mtime and UUID.
+/// Returns Vec<(mtime_secs, mtime_nanos, uuid, path)>
+async fn collect_files_with_mtime(parent: &Path) -> io::Result<Vec<(i64, u32, Uuid, PathBuf)>> {
     let mut dir = tokio::fs::read_dir(parent).await?;
-    let mut collected: Vec<T> = Vec::new();
+    let mut collected: Vec<(i64, u32, Uuid, PathBuf)> = Vec::new();
+
     while let Some(entry) = dir.next_entry().await? {
-        if entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_file())
-            .unwrap_or(false)
-            && let Some(s) = entry.file_name().to_str()
-            && let Some(v) = parse(s, &entry.path())
-        {
-            collected.push(v);
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() {
+            continue;
         }
+
+        let file_name = entry.file_name();
+        let Some(name_str) = file_name.to_str() else {
+            continue;
+        };
+
+        if !name_str.starts_with("rollout-") || !name_str.ends_with(".jsonl") {
+            continue;
+        }
+
+        // Extract UUID from filename
+        let Some((_ts, uuid)) = parse_timestamp_uuid_from_filename(name_str) else {
+            continue;
+        };
+
+        // Get file metadata for mtime
+        let path = entry.path();
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let modified = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        // Convert SystemTime to Unix timestamp
+        let duration = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mtime_secs = duration.as_secs() as i64;
+        let mtime_nanos = duration.subsec_nanos();
+
+        collected.push((mtime_secs, mtime_nanos, uuid, path));
     }
+
     Ok(collected)
 }
 
